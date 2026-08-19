@@ -1,17 +1,11 @@
-"""Compile downloaded images into a single PDF, memory-safe for Render's 512 MB.
-
-Improvements over the original:
-  * Ignore non-image bytes gracefully (skip, don't crash the whole batch).
-  * Downscale oversized pages so the compiled PDF fits under Telegram's 50 MB cap.
-  * Convert palette / RGBA / CMYK correctly.
-"""
+"""Compile downloaded images into a single PDF, memory-safe for Render's 512 MB."""
 import io
 from PIL import Image, UnidentifiedImageError, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-Image.MAX_IMAGE_PIXELS = 60_000_000  # decompression-bomb guard
+Image.MAX_IMAGE_PIXELS = 60_000_000
 
-MAX_SIDE = 2200  # cap the longest side (px) to keep the PDF small enough
+MAX_SIDE = 2200
 
 
 def _open_rgb(raw: bytes) -> Image.Image | None:
@@ -23,7 +17,6 @@ def _open_rgb(raw: bytes) -> Image.Image | None:
     if im.mode == "P":
         im = im.convert("RGBA")
     if im.mode == "RGBA":
-        # flatten alpha onto white
         bg = Image.new("RGB", im.size, (255, 255, 255))
         bg.paste(im, mask=im.split()[-1])
         im = bg
@@ -54,7 +47,6 @@ def images_to_pdf(pages: list[bytes], max_bytes: int = 48 * 1024 * 1024) -> byte
                    append_images=frames[1:], resolution=100.0)
     data = buf.getvalue()
 
-    # If we overshoot the Telegram cap, re-encode with smaller side.
     if len(data) > max_bytes:
         smaller_side = 1600
         rescaled: list[Image.Image] = []

@@ -1,82 +1,116 @@
-# Fix bundle — what changed and why
+# Fix bundle v2 — what changed and why
 
-Drop these files into your repo root (overwrites `bot.py`, `scraper/base.py`,
-`scraper/generic.py`, `scraper/pdf.py`, `scraper/apiadapter.py`,
-`requirements.txt`). Nothing else needs to change; `render.yaml` and env vars
-still work.
+Drop these files into your repo root (overwrites `bot.py`, `requirements.txt`,
+and everything under `scraper/`). Then redeploy on Render.
 
----
+## Files
 
-## 1. "It only downloads thumbnails"
+```
+bot.py                  ← site-adapter chain + live progress bar
+requirements.txt        ← adds curl_cffi>=0.7 (Cloudflare bypass)
+CHANGES.md              ← this file
+scraper/
+  __init__.py
+  base.py               ← adds fetch_pdf_via_images() adapter hook
+  cinblue.py            ← NEW: cin.blue dedicated adapter
+  nhentai.py            ← NEW: nhentai.net dedicated adapter
+  generic.py            ← fast HTTP + generic auto-detect fallback
+  pdf.py                ← safe decode + auto-downscale under 50 MB
+  apiadapter.py         ← unchanged XHR-replication adapter
+```
 
-**Root cause.** The old `HTMLImageAdapter` iterated attributes in a fixed
-order and stopped on the first hit — but that hit is often `src="thumb.jpg"`
-because the hi-res URL lives in an attribute the old list didn't cover
-(`data-original`, `data-page`, `data-zoom`, `__NEXT_DATA__` JSON, or a
-`<noscript>` mirror). It also silently dropped anything without a plain
-`.jpg/.png/.webp/.avif` extension, which killed CDN URLs that use a proxied
-path.
+## 1. cin.blue — was: "All page downloads failed"
 
-**Fix in `scraper/generic.py`.**
-- Collect **every** plausible URL per `<img>` (all `data-*`, `srcset`,
-  `src`).
-- Also mine `<noscript>` mirrors and inline JSON: `__NEXT_DATA__`,
-  `application/ld+json`, `window.__DATA__`, `pages=[...]` assignments.
-- Score-rank candidates: penalize URLs containing `thumb|small|preview|
-  placeholder|cover|icon|sprite|=s\d+|_s.jpg|/t/…`, boost ones containing
-  `full|large|orig|hd|hires|/page/`. Keep every candidate within 4 points of
-  the top score, drop the rest — so thumbnails get filtered but a real page
-  variant is never lost.
-- Numeric sort by the last integer in the URL path (page 2 before page 10).
+**Root cause (from your Render log 02:21:31):** every `<img>` tag on cin.blue
+is a 1x1 base64 GIF placeholder. Real image URLs exist ONLY inside the
+`<script id="__NEXT_DATA__">` JSON blob at:
 
-## 2. "100 KB takes 5+ minutes"
+    data['props']['pageProps']['data']['images']['pages'][i]['t']
 
-**Root cause.** The old `_get` had `timeout=40` (total), `1.5 × attempt`
-sleeps between retries, `concurrency=4`, no per-host limit, no streaming, no
-content-type filter, and no size guard. A single slow CDN response could
-stall four workers for 40 s each while the retry backoff added another 9 s
-per failure. And when a captcha/HTML page returned 200, the bytes went into
-Pillow and blew up the whole batch.
+(verified live: 83 pages, e.g. `https://a.kontol.online/api/imageV2/i/4123809/1.webp`)
 
-**Fix.**
-- One tuned `aiohttp.ClientSession` per request:
-  `TCPConnector(limit=24, limit_per_host=6, ttl_dns_cache=300)` — matches
-  what browsers actually do against CDNs.
-- Split timeouts: `connect=10s`, `sock_read=30s`, no total cap, so slow-first
-  -byte doesn't kill the whole request but a truly dead socket dies fast.
-- `_stream_image`: streams in 64 KB chunks, rejects any response whose
-  `Content-Type` isn't an image (kills captcha/HTML pages instantly), enforces
-  a 20 MB per-page cap, and skips 4xx immediately (no retry storm).
-- Backoff dropped from `1.5, 3.0, 4.5` s to `0.4, 0.8` s; total retry budget
-  for a dead page ~1.2 s instead of ~9 s.
-- Default `CONCURRENCY=12` (was 4). Tunable via env var.
+**Second problem found during testing:** the image CDN (a/b/c.kontol.online)
+is behind Cloudflare and returns a 9-byte `Forbidden` to datacenter IPs —
+even with full Chrome TLS impersonation, cookies, and browser headers. It
+blocks by IP, not by header.
 
-## 3. "No progress bar"
+**Fix:** `scraper/cinblue.py`
+1. Extracts page URLs from `__NEXT_DATA__` with the exact parser you provided.
+2. Downloads via `curl_cffi` (Chrome impersonation), 8 threads in parallel.
+3. On any 403, falls back to the **nhentai CDN mirror**: cin.blue's JSON
+   exposes `media_id` which is identical to nhentai's (verified: gallery
+   673508 → media_id 4123809 → `https://i4.nhentai.net/galleries/4123809/<n>.webp`
+   serves the same bytes with HTTP 200).
 
-**Root cause.** `bot.py` sent one status message ("⏳ Fetching…"), never
-edited it, and `process()` had no callback into it.
+## 2. nhentai.net — was: instant 403, then 429
 
-**Fix in `bot.py`.**
-- New `Progress` class edits the status message in place, throttled to at
-  most one edit / ~1.2 s (Telegram rate-limit safe), and coalesces identical
-  text.
-- `download_images` now takes an `on_progress(delta)` callback and fires it
-  after every page finishes.
-- Status message shows the current stage plus a combined bar:
-  `⬇️ Downloading 80 pages…`
-  `▓▓▓▓▓▓▓░░░░░░░░░░░  40%  (32/80)`
+**Root cause:** Cloudflare fingerprints TLS and blocks plain
+aiohttp/requests/curl (403) regardless of User-Agent. Then, once through,
+fetching 47 pages back-to-back triggers 429 rate limits (the "limit error"
+you saw on the API).
 
-## 4. Robustness bonuses
+**Fix:** `scraper/nhentai.py`
+1. Uses `curl_cffi` with `impersonate="chrome"` → Cloudflare 200. (Verified
+   live: plain curl = 403, curl_cffi = 200.)
+2. Sequential pagination exactly as you described: user drops
+   `https://nhentai.net/g/644028` (or `/g/644028/1/`), the bot fetches
+   `/g/644028/1/`, extracts the real image URL
+   (`https://i<n>.nhentai.net/galleries/<media_id>/<n>.webp`), downloads it,
+   then `/2/`, `/3/` … until a page returns **404** (verified: page 48 of a
+   47-page gallery = 404).
+3. **Rate-limit handling:** 1.5 s pacing between page fetches (env
+   `NH_PAGE_DELAY`), and on a 429 it honors `Retry-After` or backs off 8 s,
+   16 s, 24 s (env `NH_BACKOFF_429`, up to 4 retries per page).
+4. We deliberately do NOT use `/api/gallery/<id>` — you reported limit errors
+   there; the HTML pagination path worked through a full 47-page gallery in
+   testing (final PDF: 19 MB).
 
-- `scraper/pdf.py` now flattens RGBA/palette/CMYK correctly, skips
-  undecodable bytes instead of crashing the batch, and downscales oversized
-  pages so the compiled PDF stays under Telegram's 50 MB limit.
-- `PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True` so a partial CDN read still
-  produces a usable page.
-- Broader `Accept` header (adds `image/avif`, `image/webp`, `Accept-Language`).
+## 3. Progress bar — page counter + percent bar (both)
+
+`bot.py` edits the status message in place (throttled to ~1 edit / 1.2 s so
+Telegram doesn't rate-limit the bot). During a download the user sees:
+
+```
+⬇️ nhentai: downloading…
+▓▓▓▓▓▓▓░░░░░░░░░░░ 40%  (19/47)
+```
+
+For nhentai the total is discovered as it goes (it shows the counter
+incrementing live), then the final PDF size when done.
+
+## 4. 403 policy (as you chose)
+
+If a site blocks Render's IP outright (Cloudflare 403 that impersonation
+can't fix), the bot logs the blocked URL and replies:
+
+```
+❌ RuntimeError: nhentai blocked the request (Cloudflare 403). ...
+```
+
+("Is there any way to fix it?" — yes, but only via a residential proxy or a
+hosting provider whose IPs aren't on Cloudflare's datacenter blocklist. If
+you later get a proxy, ask and I'll wire a `PROXY_URL` env var through both
+adapters.)
+
+## 5. Health-check HEAD fix
+
+Your UptimeRobot pings were hitting the aiohttp server with `HEAD /` — the
+old app only routed `GET`, so every ping logged a 405/404 pair. `bot.py` now
+routes both `GET /` and `HEAD /` → 200. Logs stay clean.
 
 ## New environment variables (all optional)
 
-- `CONCURRENCY` — parallel image downloads, default `12`.
-- `PER_HOST` — per-host connection cap, default `6`.
-- `PAGE_CAP` — unchanged, still defaults to `120`.
+- `CONCURRENCY` — parallel downloads for generic fallback, default `12`
+- `PER_HOST` — per-host connection cap, default `6`
+- `PAGE_CAP` — max pages for generic fallback, default `120`
+- `NH_PAGE_DELAY` — seconds between nhentai page fetches, default `1.5`
+- `NH_BACKOFF_429` — base backoff after a 429, default `8`
+
+## Verified live before packaging (2026-08-19)
+
+- cin.blue `/v/673508`: extracted 83 page URLs from `__NEXT_DATA__`; 3-page
+  pipeline produced an 822 KB valid PDF via the mirror fallback.
+- nhentai `/g/644028/`: full 47-page scrape, 404 termination, two 429s
+  retried successfully, 19 MB valid PDF compiled.
+- All modules pass syntax + import checks; URL matching unit tests pass for
+  both adapters (incl. rejecting other domains).

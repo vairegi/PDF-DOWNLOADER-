@@ -6,6 +6,8 @@ from aiogram.types import Message, BufferedInputFile
 from aiogram.exceptions import TelegramBadRequest
 from scraper.generic import DirectPDFAdapter, HTMLImageAdapter, download_images
 from scraper.apiadapter import APIReplicateAdapter, sniff_next_data, find_urls_in_json, find_image_urls_in_json
+from scraper.cinblue import CinBlueAdapter
+from scraper.nhentai import NHentaiAdapter
 from scraper.pdf import images_to_pdf
 
 logging.basicConfig(level=logging.INFO)
@@ -71,6 +73,30 @@ def _new_session() -> ClientSession:
 
 async def process(url: str, progress: Progress) -> tuple[bytes, str]:
     async with _new_session() as s:
+        # 0) site-specific adapters first (cin.blue, nhentai)
+        for adapter in (CinBlueAdapter(), NHentaiAdapter()):
+            if not adapter.match(url):
+                continue
+            await progress.set(progress.stage(f"🎯 {adapter.name}: fetching pages…"), force=True)
+
+            total_holder = [0]
+            done = [0]
+
+            async def on_progress(delta: int):
+                done[0] += delta
+                await progress.set(
+                    progress.stage(f"⬇️ {adapter.name}: downloading…", done[0], total_holder[0])
+                )
+
+            def set_total(t: int):
+                total_holder[0] = t
+
+            pdf = await adapter.fetch_pdf_via_images(s, url, on_progress=on_progress, set_total=set_total)
+            if pdf:
+                return pdf, f"{adapter.name}.pdf"
+            # adapter matched but failed -> clear message to the user
+            raise RuntimeError(f"{adapter.name}: could not fetch any pages (site may be blocking or the gallery is gone)")
+
         # 1) replicate the JS button's XHR call (if configured)
         await progress.set(progress.stage("🔎 Checking for direct PDF endpoint…"), force=True)
         api = APIReplicateAdapter()
@@ -102,12 +128,12 @@ async def process(url: str, progress: Progress) -> tuple[bytes, str]:
 
         done = 0
 
-        async def on_progress(delta: int):
+        async def on_progress2(delta: int):
             nonlocal done
             done += delta
             await progress.set(progress.stage(f"⬇️ Downloading {total} pages…", done, total))
 
-        pages = await download_images(s, image_urls, concurrency=CONCURRENCY, on_progress=on_progress)
+        pages = await download_images(s, image_urls, concurrency=CONCURRENCY, on_progress=on_progress2)
 
         if not pages:
             raise RuntimeError("All page downloads failed. The site may be blocking or the URLs may be stale.")
@@ -126,7 +152,8 @@ async def start(m: Message):
     await m.answer(
         "Send me a reader / gallery link and I'll fetch the pages and return a PDF.\n"
         "• Direct PDFs are grabbed as-is.\n"
-        "• For image readers I auto-detect hi-res URLs (lazy-load, srcset, __NEXT_DATA__).\n"
+        "• cin.blue and nhentai.net have dedicated adapters.\n"
+        "• Other readers use auto-detect (lazy-load, srcset, __NEXT_DATA__).\n"
         f"• Cap: {PAGE_CAP} pages, {CONCURRENCY} parallel downloads."
     )
 
@@ -163,6 +190,7 @@ async def _health(_req):
 async def main():
     app = web.Application()
     app.router.add_get("/", _health)
+    app.router.add_head("/", _health)  # UptimeRobot sends HEAD
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "10000")))
