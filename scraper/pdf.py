@@ -1,75 +1,74 @@
-"""Compile downloaded images into a single PDF, memory-safe for Render's 512 MB."""
+"""Compile downloaded images into a single PDF, memory-safe for Render's 512 MB.
+
+v4 — fixes the "stuck at Compiling PDF" hang:
+  OLD: opened ALL pages, converted to RGB, held every frame in RAM
+       (~330 MB for 48 hi-res pages), then one slow Pillow save(PDF).
+       On Render's 512 MB free tier that triggered the OOM killer ->
+       process restarted mid-compile -> status message froze forever.
+  NEW: decode + resize + JPEG-encode each page ONE AT A TIME, close the
+       frame immediately (48 pages ~= 10 MB of JPEG bytes), then assemble
+       with img2pdf, which streams the JPEGs into the PDF with no
+       re-encoding and near-zero extra RAM. Typical 47-page compile:
+       a few seconds instead of minutes.
+"""
 import io
+import img2pdf
 from PIL import Image, UnidentifiedImageError, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = 60_000_000
 
-MAX_SIDE = 2200
+MAX_SIDE = 1600          # cap longest side — plenty for reading on any screen
+JPEG_QUALITY = 85
 
 
-def _open_rgb(raw: bytes) -> Image.Image | None:
+def _page_to_jpeg(raw: bytes, max_side: int, quality: int) -> bytes | None:
+    """Decode one page, flatten to RGB, resize, return JPEG bytes. Frame closed."""
     try:
         im = Image.open(io.BytesIO(raw))
         im.load()
     except (UnidentifiedImageError, OSError, ValueError):
         return None
-    if im.mode == "P":
-        im = im.convert("RGBA")
-    if im.mode == "RGBA":
-        bg = Image.new("RGB", im.size, (255, 255, 255))
-        bg.paste(im, mask=im.split()[-1])
-        im = bg
-    elif im.mode not in ("RGB", "L"):
-        im = im.convert("RGB")
-    elif im.mode == "L":
-        im = im.convert("RGB")
+    try:
+        if im.mode == "P":
+            im = im.convert("RGBA")
+        if im.mode == "RGBA":
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            im = bg
+        elif im.mode != "RGB":
+            im = im.convert("RGB")
 
-    w, h = im.size
-    m = max(w, h)
-    if m > MAX_SIDE:
-        scale = MAX_SIDE / m
-        im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-    return im
+        w, h = im.size
+        m = max(w, h)
+        if m > max_side:
+            scale = max_side / m
+            im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=quality, optimize=True)
+        return buf.getvalue()
+    finally:
+        try:
+            im.close()
+        except Exception:
+            pass
 
 
 def images_to_pdf(pages: list[bytes], max_bytes: int = 48 * 1024 * 1024) -> bytes:
-    frames: list[Image.Image] = []
-    for raw in pages:
-        im = _open_rgb(raw)
-        if im is not None:
-            frames.append(im)
-    if not frames:
+    # Pass 1: normal settings, one page at a time (low peak RAM)
+    jpegs = [j for raw in pages if (j := _page_to_jpeg(raw, MAX_SIDE, JPEG_QUALITY))]
+    if not jpegs:
         raise ValueError("no images could be decoded")
 
-    buf = io.BytesIO()
-    frames[0].save(buf, format="PDF", save_all=True,
-                   append_images=frames[1:], resolution=100.0)
-    data = buf.getvalue()
+    data = img2pdf.convert(jpegs)
 
+    # Pass 2 (rare): too big for Telegram — re-encode smaller
     if len(data) > max_bytes:
-        smaller_side = 1600
-        rescaled: list[Image.Image] = []
-        for f in frames:
-            w, h = f.size
-            m = max(w, h)
-            if m > smaller_side:
-                scale = smaller_side / m
-                rescaled.append(f.resize((int(w * scale), int(h * scale)), Image.LANCZOS))
-            else:
-                rescaled.append(f)
-        buf = io.BytesIO()
-        rescaled[0].save(buf, format="PDF", save_all=True,
-                         append_images=rescaled[1:], resolution=90.0)
-        data = buf.getvalue()
-        for f in rescaled:
-            f.close()
-
-    for f in frames:
-        try:
-            f.close()
-        except Exception:
-            pass
+        jpegs = [j for raw in pages if (j := _page_to_jpeg(raw, 1200, 70))]
+        if not jpegs:
+            raise ValueError("no images could be decoded")
+        data = img2pdf.convert(jpegs)
 
     if len(data) > max_bytes:
         raise ValueError(f"compiled PDF is {len(data) // 1048576} MB, over Telegram's 50 MB limit")

@@ -16,7 +16,6 @@ Optional:
   PORT               Render injects this; default 10000
 """
 import asyncio, logging, os, re, time
-from urllib.parse import urlparse
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 from aiogram import Bot, Dispatcher, F
@@ -153,9 +152,10 @@ async def handle(m: Message):
         if not pages:
             raise RuntimeError("All image downloads failed")
 
-        # 3) compile + send
+        # 3) compile (streaming, low RAM) + send
         await progress.set(f"📚 Compiling PDF from {len(pages)} pages…", force=True)
         pdf = await asyncio.to_thread(images_to_pdf, pages)
+        del pages  # free page bytes before upload
 
         m_id = re.search(r"/g/(\d+)", url)
         name = f"nhentai_{m_id.group(1)}.pdf" if m_id else "document.pdf"
@@ -183,6 +183,8 @@ async def main():
     log.info("userbot connected as %s", await bridge.whoami())
 
     app = web.Application()
+    # NOTE: aiohttp's add_get registers HEAD automatically — do NOT add_head
+    # separately (that was the "Added route will never be executed" crash).
     app.router.add_get("/", _health)
     runner = web.AppRunner(app)
     await runner.setup()

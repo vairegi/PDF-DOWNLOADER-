@@ -3,4 +3,5 @@ aiohttp>=3.9
 Pillow>=10.0
 beautifulsoup4>=4.12
 telethon>=1.34
+img2pdf>=0.5
 python-dotenv>=1.0
