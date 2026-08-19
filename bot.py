@@ -184,7 +184,6 @@ async def main():
 
     app = web.Application()
     app.router.add_get("/", _health)
-    app.router.add_head("/", _health)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "10000")))
