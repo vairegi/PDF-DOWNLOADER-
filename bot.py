@@ -1,22 +1,48 @@
+"""Hybrid bot: BotFather bot (aiogram) talks to users; a Telethon userbot
+does the @nHentaiBot roundtrip in the background and hands back a
+telegra.ph article URL, which we scrape (no anti-bot there) into a PDF.
+
+Required env vars (Render):
+  BOT_TOKEN          BotFather token
+  API_ID             from my.telegram.org
+  API_HASH           from my.telegram.org
+  TELEGRAM_SESSION   Telethon StringSession (run session_gen.py locally once)
+
+Optional:
+  NH_BOT_USERNAME    default "nHentaiBot"
+  NH_TIMEOUT         seconds to wait for @nHentaiBot reply, default 30
+  PAGE_CAP           default 120
+  CONCURRENCY        parallel image downloads, default 12
+  PORT               Render injects this; default 10000
+"""
 import asyncio, logging, os, re, time
+from urllib.parse import urlparse
+
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, BufferedInputFile
 from aiogram.exceptions import TelegramBadRequest
-from scraper.generic import DirectPDFAdapter, HTMLImageAdapter, download_images
-from scraper.apiadapter import APIReplicateAdapter, sniff_next_data, find_urls_in_json, find_image_urls_in_json
-from scraper.cinblue import CinBlueAdapter
-from scraper.nhentai import NHentaiAdapter
+
+from scraper.userbot_bridge import UserbotBridge
+from scraper.telegraph import fetch_telegraph_image_urls
+from scraper.generic import download_images
 from scraper.pdf import images_to_pdf
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pdfbot")
-TOKEN = os.environ["BOT_TOKEN"]
-URL_RE = re.compile(r"https?://\S+")
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+TELEGRAM_SESSION = os.environ["TELEGRAM_SESSION"]
+NH_BOT = os.environ.get("NH_BOT_USERNAME", "nHentaiBot").lstrip("@")
+NH_TIMEOUT = int(os.environ.get("NH_TIMEOUT", "30"))
 PAGE_CAP = int(os.environ.get("PAGE_CAP", "120"))
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "12"))
-PER_HOST = int(os.environ.get("PER_HOST", "6"))
+
+URL_RE = re.compile(r"https?://\S+")
+NHENTAI_RE = re.compile(r"https?://(?:www\.)?nhentai\.net/g/\d+", re.I)
 
 
 def _bar(done: int, total: int, width: int = 18) -> str:
@@ -28,7 +54,7 @@ def _bar(done: int, total: int, width: int = 18) -> str:
 
 
 class Progress:
-    """Throttled status-message editor. Coalesces updates so we don't spam Telegram."""
+    """Throttled status-message editor."""
 
     def __init__(self, bot: Bot, chat_id: int, message_id: int, min_interval: float = 1.2):
         self.bot = bot
@@ -51,131 +77,95 @@ class Progress:
         try:
             await self.bot.edit_message_text(text, chat_id=self.chat_id, message_id=self.message_id)
         except TelegramBadRequest:
-            pass  # "message is not modified" etc.
+            pass
 
-    def stage(self, label: str, done: int = 0, total: int = 0):
+    def stage(self, label: str, done: int = 0, total: int = 0) -> str:
         if total > 0:
             return f"{label}\n{_bar(done, total)}  ({done}/{total})"
-        return f"{label}"
+        return label
 
 
 def _new_session() -> ClientSession:
-    """One session per request, tuned for reader-site CDNs (Render 512 MB safe)."""
-    connector = TCPConnector(
-        limit=CONCURRENCY * 2,
-        limit_per_host=PER_HOST,
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True,
-    )
+    connector = TCPConnector(limit=CONCURRENCY * 2, limit_per_host=CONCURRENCY,
+                             ttl_dns_cache=300, enable_cleanup_closed=True)
     timeout = ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=30)
     return ClientSession(connector=connector, timeout=timeout)
 
 
-async def process(url: str, progress: Progress) -> tuple[bytes, str]:
-    async with _new_session() as s:
-        # 0) site-specific adapters first (cin.blue, nhentai)
-        for adapter in (CinBlueAdapter(), NHentaiAdapter()):
-            if not adapter.match(url):
-                continue
-            await progress.set(progress.stage(f"🎯 {adapter.name}: fetching pages…"), force=True)
-
-            total_holder = [0]
-            done = [0]
-
-            async def on_progress(delta: int):
-                done[0] += delta
-                await progress.set(
-                    progress.stage(f"⬇️ {adapter.name}: downloading…", done[0], total_holder[0])
-                )
-
-            def set_total(t: int):
-                total_holder[0] = t
-
-            pdf = await adapter.fetch_pdf_via_images(s, url, on_progress=on_progress, set_total=set_total)
-            if pdf:
-                return pdf, f"{adapter.name}.pdf"
-            # adapter matched but failed -> clear message to the user
-            raise RuntimeError(f"{adapter.name}: could not fetch any pages (site may be blocking or the gallery is gone)")
-
-        # 1) replicate the JS button's XHR call (if configured)
-        await progress.set(progress.stage("🔎 Checking for direct PDF endpoint…"), force=True)
-        api = APIReplicateAdapter()
-        if api.match(url):
-            log.info("trying API-replication adapter for %s", url)
-            pdf = await api.fetch_pdf(s, url)
-            if pdf:
-                return pdf, "document.pdf"
-
-        # 2) Direct-PDF probe on the URL itself
-        direct = DirectPDFAdapter()
-        pdf = await direct.fetch_pdf(s, url)
-        if pdf:
-            return pdf, "document.pdf"
-
-        # 3) Auto-detect image list (Next.js JSON blob first, then HTML)
-        await progress.set(progress.stage("🧭 Parsing reader page…"), force=True)
-        html_adapter = HTMLImageAdapter()
-        image_urls = await html_adapter.fetch_image_urls(s, url)
-
-        if not image_urls:
-            raise RuntimeError("No downloadable images or PDF were found on this page.")
-
-        if len(image_urls) > PAGE_CAP:
-            image_urls = image_urls[:PAGE_CAP]
-
-        total = len(image_urls)
-        await progress.set(progress.stage(f"⬇️ Downloading {total} pages…", 0, total), force=True)
-
-        done = 0
-
-        async def on_progress2(delta: int):
-            nonlocal done
-            done += delta
-            await progress.set(progress.stage(f"⬇️ Downloading {total} pages…", done, total))
-
-        pages = await download_images(s, image_urls, concurrency=CONCURRENCY, on_progress=on_progress2)
-
-        if not pages:
-            raise RuntimeError("All page downloads failed. The site may be blocking or the URLs may be stale.")
-
-        await progress.set(progress.stage(f"📚 Compiling PDF from {len(pages)} pages…"), force=True)
-        pdf = await asyncio.to_thread(images_to_pdf, pages)
-        return pdf, "document.pdf"
-
-
-bot = Bot(TOKEN)
+bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+bridge = UserbotBridge(API_ID, API_HASH, TELEGRAM_SESSION, NH_BOT)
 
 
 @dp.message(CommandStart())
 async def start(m: Message):
     await m.answer(
-        "Send me a reader / gallery link and I'll fetch the pages and return a PDF.\n"
-        "• Direct PDFs are grabbed as-is.\n"
-        "• cin.blue and nhentai.net have dedicated adapters.\n"
-        "• Other readers use auto-detect (lazy-load, srcset, __NEXT_DATA__).\n"
-        f"• Cap: {PAGE_CAP} pages, {CONCURRENCY} parallel downloads."
+        "Send me an nhentai.net gallery link (e.g. https://nhentai.net/g/123456).\n"
+        "I'll fetch the Telegra.ph article for it and return a PDF.\n"
+        f"Cap: {PAGE_CAP} pages."
     )
 
 
 @dp.message(F.text)
 async def handle(m: Message):
-    urls = URL_RE.findall(m.text or "")
+    text = m.text or ""
+    urls = URL_RE.findall(text)
     if not urls:
-        await m.reply("Send a URL.")
+        await m.reply("Send an nhentai.net gallery link.")
         return
     url = urls[0]
+    if not NHENTAI_RE.search(url):
+        await m.reply("❌ Only nhentai.net gallery links are supported.")
+        return
+
     status = await m.answer("⏳ Starting…")
     progress = Progress(bot, status.chat.id, status.message_id)
     started = time.monotonic()
+
     try:
-        pdf, name = await process(url, progress)
+        # 1) userbot roundtrip: send URL to @nHentaiBot, wait for telegra.ph reply
+        await progress.set(f"🤝 Asking @{NH_BOT} for the Telegra.ph article…", force=True)
+        tg_url = await bridge.request_telegraph(url, timeout=NH_TIMEOUT)
+        if not tg_url:
+            raise RuntimeError(f"@{NH_BOT} did not respond — try again later")
+
+        # 2) extract image URLs from the telegra.ph article
+        await progress.set("📄 Got Telegra.ph article — extracting images…", force=True)
+        async with _new_session() as s:
+            image_urls = await fetch_telegraph_image_urls(s, tg_url)
+            if not image_urls:
+                raise RuntimeError("Telegra.ph article contained no images")
+            if len(image_urls) > PAGE_CAP:
+                image_urls = image_urls[:PAGE_CAP]
+
+            total = len(image_urls)
+            done = 0
+            await progress.set(progress.stage(f"⬇️ Downloading {total} pages…", 0, total), force=True)
+
+            async def on_progress(delta: int):
+                nonlocal done
+                done += delta
+                await progress.set(progress.stage(f"⬇️ Downloading {total} pages…", done, total))
+
+            pages = await download_images(s, image_urls, concurrency=CONCURRENCY,
+                                          on_progress=on_progress, referer=tg_url)
+
+        if not pages:
+            raise RuntimeError("All image downloads failed")
+
+        # 3) compile + send
+        await progress.set(f"📚 Compiling PDF from {len(pages)} pages…", force=True)
+        pdf = await asyncio.to_thread(images_to_pdf, pages)
+
+        m_id = re.search(r"/g/(\d+)", url)
+        name = f"nhentai_{m_id.group(1)}.pdf" if m_id else "document.pdf"
         elapsed = time.monotonic() - started
         await progress.set(f"✅ Done in {elapsed:.1f}s — uploading PDF…", force=True)
         await m.answer_document(BufferedInputFile(pdf, filename=name))
+
     except Exception as e:
         log.exception("process failed")
-        await progress.set(f"❌ {type(e).__name__}: {e}", force=True)
+        await progress.set(f"❌ {e}", force=True)
         return
     try:
         await status.delete()
@@ -188,14 +178,23 @@ async def _health(_req):
 
 
 async def main():
+    # userbot first — if the session is invalid we fail fast at startup
+    await bridge.start()
+    log.info("userbot connected as %s", await bridge.whoami())
+
     app = web.Application()
     app.router.add_get("/", _health)
+    app.router.add_head("/", _health)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "10000")))
     await site.start()
     log.info("HTTP health server started")
-    await dp.start_polling(bot)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bridge.stop()
 
 
 if __name__ == "__main__":
